@@ -5,30 +5,44 @@
       <input v-model="name" placeholder="Cluster Name" required />
       <button :disabled="loading">{{ loading ? "Loading..." : "Get" }}</button>
     </form>
-    <pre v-if="info" class="json">{{ info }}</pre>
+    <div v-if="infoObj" class="result">
+      <div class="result-row"><strong>Name:</strong> <span>{{ infoObj.clusterName }}</span></div>
+      <div class="result-row"><strong>User:</strong> <span>{{ infoObj.user }}</span></div>
+      <div class="result-row"><strong>Databases:</strong> <span>{{ infoObj.databases?.join(', ') }}</span></div>
+      <div class="result-row"><strong>Storage:</strong> <span>{{ infoObj.storage }}</span></div>
+      <div class="result-row"><strong>NodePort:</strong> <span>{{ infoObj.nodePort || 'Pending...' }}</span></div>
+    </div>
     <p v-if="message" :class="messageType">{{ message }}</p>
   </div>
 </template>
 
 <script setup>
-import { ref } from 'vue'
+import { ref, defineExpose } from 'vue'
 const name = ref('')
-const info = ref('')
+const infoObj = ref(null)
 const loading = ref(false)
 const message = ref('')
 const messageType = ref('')
 
+defineExpose({
+  showCluster(n) {
+    name.value = n
+    getCluster()
+  }
+})
+
 async function getCluster() {
   loading.value = true
-  info.value = ''
+  infoObj.value = null
   message.value = ''
   try {
-    const res = await fetch(`/api/get?name=${encodeURIComponent(name.value)}`)
+    const res = await fetch(`http://168.119.243.127:30002/get?name=${encodeURIComponent(name.value)}`)
     if (!res.ok) throw new Error(await res.text())
     const data = await res.json()
-    info.value = JSON.stringify(data, null, 2)
+    infoObj.value = data
     message.value = ''
   } catch (err) {
+    infoObj.value = null
     message.value = err.message
     messageType.value = 'error'
   } finally {
@@ -72,14 +86,21 @@ button:disabled {
   background: #88bffc;
   cursor: not-allowed;
 }
-.json {
-  background: #f7f8fa;
-  border-radius: 8px;
+.result {
+  margin: 1rem 0 0 0;
   padding: 1rem;
-  font-size: 0.93rem;
-  color: #111;
-  max-width: 100%;
-  overflow-x: auto;
+  background: #f3f7fa;
+  border-radius: 8px;
+  font-size: 0.98rem;
+}
+.result-row {
+  margin-bottom: 0.4rem;
+  display: flex;
+  gap: 1rem;
+}
+.result-row strong {
+  width: 110px;
+  display: inline-block;
 }
 .error {
   color: #e25241;

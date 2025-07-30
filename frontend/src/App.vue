@@ -2,8 +2,8 @@
   <div class="container">
     <h1>Postgres Cluster Manager</h1>
     <CreateCluster @created="refreshClusters" />
-    <GetCluster />
-    <ClusterList ref="listRef" @deleted="refreshClusters" />
+    <GetCluster ref="getRef" />
+    <ClusterList ref="listRef" @deleted="refreshClusters" @get="openGet" />
   </div>
 </template>
 
@@ -14,8 +14,13 @@ import GetCluster from './components/GetCluster.vue'
 import ClusterList from './components/ClusterList.vue'
 
 const listRef = ref(null)
+const getRef = ref(null)
+
 function refreshClusters() {
   listRef.value?.fetchClusters()
+}
+function openGet(name) {
+  getRef.value?.showCluster(name)
 }
 </script>
 

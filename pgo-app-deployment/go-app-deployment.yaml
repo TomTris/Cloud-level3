@@ -22,7 +22,7 @@ spec:
       serviceAccountName: go-backend-sa
       containers:
         - name: go-backend
-          image: "tomtris02/go-app-backend:v1"
+          image: "tomtris02/go-app-backend:v3"
           imagePullPolicy: Always
           ports:
             - containerPort: 8080

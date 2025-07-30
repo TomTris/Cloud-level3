@@ -6,13 +6,17 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
+	"time"
 
 	"github.com/rs/cors"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 )
 
@@ -32,17 +36,44 @@ var (
 type PostgresClusterRequest struct {
 	Name      string   `json:"name"`
 	User      string   `json:"user"`
+	Password  string   `json:"password"`
 	Databases []string `json:"databases"`
-	Storage   string   `json:"storage"` // e.g. "200Mi", "1Gi", "1.5Gi"
+	Storage   string   `json:"storage"`
 }
 
-// Create a dynamic Kubernetes client
+// API Response struct
+type CreateClusterResponse struct {
+	ClusterName string   `json:"clusterName"`
+	User        string   `json:"user"`
+	Databases   []string `json:"databases"`
+	Storage     string   `json:"storage"`
+	Password    string   `json:"password"`
+	NodePort    int32    `json:"nodePort"`
+}
+
+type GetClusterResponse struct {
+	ClusterName string   `json:"clusterName"`
+	User        string   `json:"user"`
+	Databases   []string `json:"databases"`
+	Storage     string   `json:"storage"`
+	Password    string   `json:"password"`
+	NodePort    int32    `json:"nodePort"`
+}
+
 func getDynamicClient() (dynamic.Interface, error) {
 	config, err := rest.InClusterConfig()
 	if err != nil {
 		return nil, err
 	}
 	return dynamic.NewForConfig(config)
+}
+
+func getKubeClientset() (*kubernetes.Clientset, error) {
+	config, err := rest.InClusterConfig()
+	if err != nil {
+		return nil, err
+	}
+	return kubernetes.NewForConfig(config)
 }
 
 func createPostgresCluster(w http.ResponseWriter, r *http.Request) {
@@ -52,13 +83,20 @@ func createPostgresCluster(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Basic validation
-	if req.Name == "" || req.User == "" || len(req.Databases) == 0 || req.Storage == "" {
-		http.Error(w, "name, user, databases, and storage are required", http.StatusBadRequest)
+	if req.Name == "" || req.User == "" || req.Password == "" || len(req.Databases) == 0 || req.Storage == "" {
+		http.Error(w, "name, user, password, databases, and storage are required", http.StatusBadRequest)
 		return
 	}
 
-	// Build PostgresCluster object (unstructured)
+	ctx := context.Background()
+
+	clientset, err := getKubeClientset()
+	if err != nil {
+		http.Error(w, "k8s clientset error: "+err.Error(), 500)
+		return
+	}
+
+	log.Printf("start creating postgresCluster")
 	cluster := &unstructured.Unstructured{
 		Object: map[string]interface{}{
 			"apiVersion": "postgres-operator.crunchydata.com/v1beta1",
@@ -79,8 +117,8 @@ func createPostgresCluster(w http.ResponseWriter, r *http.Request) {
 				},
 				"instances": []interface{}{
 					map[string]interface{}{
-						"name":    "instance1",
-						"replica": 2,
+						"name":     "instance1",
+						"replicas": int32(2),
 						"dataVolumeClaimSpec": map[string]interface{}{
 							"accessModes": []interface{}{"ReadWriteOnce"},
 							"resources": map[string]interface{}{
@@ -119,19 +157,82 @@ func createPostgresCluster(w http.ResponseWriter, r *http.Request) {
 
 	client, err := getDynamicClient()
 	if err != nil {
-		http.Error(w, "k8s client error: "+err.Error(), 500)
+		http.Error(w, "k8s dynamic client error: "+err.Error(), 500)
 		return
 	}
-	ctx := context.Background()
 
-	// Create
-	created, err := client.Resource(gvr).Namespace(pgoNamespace).Create(ctx, cluster, metav1.CreateOptions{})
+	_, err = client.Resource(gvr).Namespace(pgoNamespace).Create(ctx, cluster, metav1.CreateOptions{})
 	if err != nil {
 		http.Error(w, "k8s create error: "+err.Error(), 500)
 		return
 	}
+
+	log.Printf("PostgresCluster %s created successfully", req.Name)
+
+	serviceNames := []string{
+		req.Name + "-ha",
+		req.Name + "-primary",
+	}
+
+	var nodePort int32
+	found := false
+	for i := 0; i < 20 && !found; i++ {
+		for _, serviceName := range serviceNames {
+			svc, err := clientset.CoreV1().Services(pgoNamespace).Get(ctx, serviceName, metav1.GetOptions{})
+			if err == nil && len(svc.Spec.Ports) > 0 {
+				for _, port := range svc.Spec.Ports {
+					if port.NodePort != 0 {
+						nodePort = port.NodePort
+						found = true
+						break
+					}
+				}
+			}
+			if found {
+				break
+			}
+		}
+		time.Sleep(1 * time.Second)
+	}
+
+	// Wait for the pguser secret to be created by the operator (up to 30s)
+	userSecretName := req.Name + "-pguser-" + req.User
+	var userSecret *corev1.Secret
+	secretFound := false
+	for i := 0; i < 30; i++ {
+		userSecret, err = clientset.CoreV1().Secrets(pgoNamespace).Get(ctx, userSecretName, metav1.GetOptions{})
+		if err == nil {
+			secretFound = true
+			break
+		}
+		time.Sleep(1 * time.Second)
+	}
+	if !secretFound {
+		http.Error(w, "user secret not created by operator in time", 500)
+		return
+	}
+
+	if userSecret.StringData == nil {
+		userSecret.StringData = map[string]string{}
+	}
+	userSecret.StringData["password"] = req.Password
+	_, err = clientset.CoreV1().Secrets(pgoNamespace).Update(ctx, userSecret, metav1.UpdateOptions{})
+	if err != nil {
+		http.Error(w, "failed to update user password secret: "+err.Error(), 500)
+		return
+	}
+	log.Printf("Updated secret %s with new password", userSecretName)
+
+	resp := CreateClusterResponse{
+		ClusterName: req.Name,
+		User:        req.User,
+		Databases:   req.Databases,
+		Storage:     req.Storage,
+		Password:    req.Password,
+		NodePort:    nodePort,
+	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(created.Object)
+	json.NewEncoder(w).Encode(resp)
 }
 
 func getPostgresCluster(w http.ResponseWriter, r *http.Request) {
@@ -151,8 +252,76 @@ func getPostgresCluster(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "not found: "+err.Error(), 404)
 		return
 	}
+
+	// Parse fields from the returned object
+	spec, _ := obj.Object["spec"].(map[string]interface{})
+	users, _ := spec["users"].([]interface{})
+	var user string
+	var databases []string
+	if len(users) > 0 {
+		userObj, _ := users[0].(map[string]interface{})
+		user, _ = userObj["name"].(string)
+		if dbs, ok := userObj["databases"].([]interface{}); ok {
+			for _, db := range dbs {
+				if dbStr, ok := db.(string); ok {
+					databases = append(databases, dbStr)
+				}
+			}
+		}
+	}
+	storage := ""
+	instances, _ := spec["instances"].([]interface{})
+	if len(instances) > 0 {
+		inst, _ := instances[0].(map[string]interface{})
+		if dvc, ok := inst["dataVolumeClaimSpec"].(map[string]interface{}); ok {
+			if resources, ok := dvc["resources"].(map[string]interface{}); ok {
+				if requests, ok := resources["requests"].(map[string]interface{}); ok {
+					storage, _ = requests["storage"].(string)
+				}
+			}
+		}
+	}
+
+	// Find NodePort (same logic as in createPostgresCluster)
+	clientset, err := getKubeClientset()
+	if err != nil {
+		http.Error(w, "k8s clientset error: "+err.Error(), 500)
+		return
+	}
+	serviceNames := []string{
+		name + "-ha",
+		name + "-primary",
+	}
+	var nodePort int32
+	found := false
+	for i := 0; i < 5 && !found; i++ {
+		for _, serviceName := range serviceNames {
+			svc, err := clientset.CoreV1().Services(pgoNamespace).Get(ctx, serviceName, metav1.GetOptions{})
+			if err == nil && len(svc.Spec.Ports) > 0 {
+				for _, port := range svc.Spec.Ports {
+					if port.NodePort != 0 {
+						nodePort = port.NodePort
+						found = true
+						break
+					}
+				}
+			}
+			if found {
+				break
+			}
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	resp := GetClusterResponse{
+		ClusterName: name,
+		User:        user,
+		Databases:   databases,
+		Storage:     storage,
+		NodePort:    nodePort,
+	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(obj.Object)
+	json.NewEncoder(w).Encode(resp)
 }
 
 func deletePostgresCluster(w http.ResponseWriter, r *http.Request) {
@@ -161,17 +330,77 @@ func deletePostgresCluster(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "missing name param", 400)
 		return
 	}
+	ctx := context.Background()
 	client, err := getDynamicClient()
 	if err != nil {
 		http.Error(w, "k8s client error: "+err.Error(), 500)
 		return
 	}
-	ctx := context.Background()
+	clientset, err := getKubeClientset()
+	if err != nil {
+		http.Error(w, "k8s clientset error: "+err.Error(), 500)
+		return
+	}
+
+	// 1. Delete PostgresCluster CR
 	err = client.Resource(gvr).Namespace(pgoNamespace).Delete(ctx, name, metav1.DeleteOptions{})
 	if err != nil {
 		http.Error(w, "delete error: "+err.Error(), 500)
 		return
 	}
+
+	// 2. Wait for CR to actually disappear (finalizers, etc), up to 30 seconds
+	for i := 0; i < 30; i++ {
+		_, err := client.Resource(gvr).Namespace(pgoNamespace).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			break
+		}
+		time.Sleep(1 * time.Second)
+	}
+
+	// 3. Clean up leftover k8s resources by name pattern (if any still exist)
+	prefix := name
+
+	// Services
+	svcList, _ := clientset.CoreV1().Services(pgoNamespace).List(ctx, metav1.ListOptions{})
+	for _, svc := range svcList.Items {
+		if strings.HasPrefix(svc.Name, prefix) {
+			_ = clientset.CoreV1().Services(pgoNamespace).Delete(ctx, svc.Name, metav1.DeleteOptions{})
+		}
+	}
+
+	// StatefulSets
+	ssList, _ := clientset.AppsV1().StatefulSets(pgoNamespace).List(ctx, metav1.ListOptions{})
+	for _, ss := range ssList.Items {
+		if strings.HasPrefix(ss.Name, prefix) {
+			_ = clientset.AppsV1().StatefulSets(pgoNamespace).Delete(ctx, ss.Name, metav1.DeleteOptions{})
+		}
+	}
+
+	// Jobs (backups, etc)
+	jobList, _ := clientset.BatchV1().Jobs(pgoNamespace).List(ctx, metav1.ListOptions{})
+	for _, job := range jobList.Items {
+		if strings.HasPrefix(job.Name, prefix) {
+			_ = clientset.BatchV1().Jobs(pgoNamespace).Delete(ctx, job.Name, metav1.DeleteOptions{})
+		}
+	}
+
+	// Pods (should be cleaned up with above, but in case some orphaned)
+	podList, _ := clientset.CoreV1().Pods(pgoNamespace).List(ctx, metav1.ListOptions{})
+	for _, pod := range podList.Items {
+		if strings.HasPrefix(pod.Name, prefix) {
+			_ = clientset.CoreV1().Pods(pgoNamespace).Delete(ctx, pod.Name, metav1.DeleteOptions{})
+		}
+	}
+
+	// PVCs (optional, if you want to forcibly remove persistent data)
+	pvcList, _ := clientset.CoreV1().PersistentVolumeClaims(pgoNamespace).List(ctx, metav1.ListOptions{})
+	for _, pvc := range pvcList.Items {
+		if strings.HasPrefix(pvc.Name, prefix) {
+			_ = clientset.CoreV1().PersistentVolumeClaims(pgoNamespace).Delete(ctx, pvc.Name, metav1.DeleteOptions{})
+		}
+	}
+
 	w.WriteHeader(204)
 }
 
@@ -187,25 +416,17 @@ func listPostgresClusters(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "list error: "+err.Error(), 500)
 		return
 	}
-
-	// Extract the "items" array from UnstructuredList
 	items := list.Items
 	clusterNames := []string{}
 	for _, item := range items {
 		clusterNames = append(clusterNames, item.GetName())
 	}
-
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(clusterNames)
 }
 
 func main() {
 	mux := http.NewServeMux()
-	// http.HandleFunc("/create", createPostgresCluster)
-	// http.HandleFunc("/get", getPostgresCluster)
-	// http.HandleFunc("/delete", deletePostgresCluster)
-	// http.HandleFunc("/list", listPostgresClusters)
-
 	mux.HandleFunc("/create", createPostgresCluster)
 	mux.HandleFunc("/get", getPostgresCluster)
 	mux.HandleFunc("/delete", deletePostgresCluster)
@@ -215,8 +436,7 @@ func main() {
 	if port == "" {
 		port = "8080"
 	}
-	handler := cors.AllowAll().Handler(mux) // allow all origins for simplicity
-
+	handler := cors.AllowAll().Handler(mux)
 	log.Println("pgo-go-backend listening on :" + port)
 	log.Fatal(http.ListenAndServe(":"+port, handler))
 }

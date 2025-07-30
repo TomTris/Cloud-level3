@@ -6,7 +6,7 @@ kubectl apply -k kustomize/install/namespace
 kubectl apply --server-side -k kustomize/install/default
 kubectl -n postgres-operator get pods --selector=postgres-operator.crunchydata.com/control-plane=postgres-operator --field-selector=status.phase=Running
 # wait until pod is done, then
-sleep 120 # wait until operator is ready
+sleep 150 # wait until operator is ready
 
 kubectl apply -k kustomize/postgres
 kubectl get secret -n postgres-operator hippo-pguser-hippo -o yaml # <clusterName>-pguser-<userName>
