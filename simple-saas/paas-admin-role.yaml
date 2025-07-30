@@ -1,0 +1,15 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: paas-admin-role
+rules:
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  verbs: ["create", "get", "list", "watch", "update", "delete"]
+- apiGroups: [""]
+  resources: ["services"]
+  verbs: ["create", "get", "list", "watch", "update", "delete"]
+- apiGroups: [""]
+  resources: ["namespaces"]
+  verbs: ["create", "get", "list", "watch", "update", "delete"]
+# Add more rules as needed
